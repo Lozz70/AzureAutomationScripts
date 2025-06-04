@@ -1,0 +1,126 @@
+# Azure Automation Runbook: Manage Disk Snapshot Resource Locks
+# Description: Iterates through all disk snapshots in a resource group and manages resource locks based on snapshot age
+# - Snapshots less than 2 days old: Add resource lock if none exists
+# - Snapshots more than 2 days old: Remove resource lock if it exists
+# Schedule: Run daily (every 24 hours)
+
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$ResourceGroupName,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$LockName = "AutoSnapshot-CannotDelete"
+)
+
+# Set error action preference to stop the runbook on any error
+$ErrorActionPreference = "Stop"
+
+try {
+    Write-Output "Starting disk snapshot resource lock management for Resource Group: $ResourceGroupName"
+    Write-Output "Current time: $(Get-Date)"
+    
+    # Connect to Azure using Managed Identity
+    Write-Output "Connecting to Azure using Managed Identity..."
+    Connect-AzAccount -Identity
+    
+    # Get current date for age comparison
+    $currentDate = Get-Date
+    $twoDaysAgo = $currentDate.AddDays(-2)
+    Write-Output "Snapshots created before $twoDaysAgo will have locks removed"
+    Write-Output "Snapshots created after $twoDaysAgo will have locks added if missing"
+    
+    # Get all disk snapshots in the specified resource group
+    Write-Output "Retrieving all disk snapshots from Resource Group: $ResourceGroupName"
+    $snapshots = Get-AzSnapshot -ResourceGroupName $ResourceGroupName
+    
+    if ($snapshots.Count -eq 0) {
+        Write-Output "No snapshots found in Resource Group: $ResourceGroupName"
+        return
+    }
+    
+    Write-Output "Found $($snapshots.Count) snapshot(s) to process"
+    
+    # Initialize counters for reporting
+    $processedCount = 0
+    $locksAdded = 0
+    $locksRemoved = 0
+    $errorsCount = 0
+    
+    # Process each snapshot
+    foreach ($snapshot in $snapshots) {
+        try {
+            $processedCount++
+            $snapshotName = $snapshot.Name
+            $creationTime = $snapshot.TimeCreated
+            $snapshotAge = ($currentDate - $creationTime).Days
+            
+            Write-Output "Processing snapshot '$snapshotName' (Created: $creationTime, Age: $snapshotAge days)"
+            
+            # Check if snapshot is less than 2 days old
+            if ($creationTime -gt $twoDaysAgo) {
+                Write-Output "  Snapshot is $snapshotAge days old (less than 2 days) - checking for resource lock"
+                
+                # Check if resource lock already exists
+                $existingLock = Get-AzResourceLock -ResourceName $snapshotName -ResourceType "Microsoft.Compute/snapshots" -ResourceGroupName $ResourceGroupName -ErrorAction SilentlyContinue
+                
+                if ($existingLock) {
+                    Write-Output "  Resource lock already exists: $($existingLock.Name)"
+                } else {
+                    # Create resource lock to prevent deletion
+                    Write-Output "  Creating resource lock to prevent deletion..."
+                    $newLock = New-AzResourceLock -LockLevel CanNotDelete -LockName $LockName -ResourceName $snapshotName -ResourceType "Microsoft.Compute/snapshots" -ResourceGroupName $ResourceGroupName -LockNotes "Auto-created lock for recent snapshot (less than 2 days old)" -Force
+                    Write-Output "  Successfully created resource lock: $($newLock.Name)"
+                    $locksAdded++
+                }
+            }
+            else {
+                Write-Output "  Snapshot is $snapshotAge days old (more than 2 days) - checking for resource lock to remove"
+                
+                # Check if resource lock exists and remove it
+                $existingLock = Get-AzResourceLock -ResourceName $snapshotName -ResourceType "Microsoft.Compute/snapshots" -ResourceGroupName $ResourceGroupName -ErrorAction SilentlyContinue
+                
+                if ($existingLock) {
+                    Write-Output "  Found resource lock: $($existingLock.Name) - removing it..."
+                    Remove-AzResourceLock -LockName $existingLock.Name -ResourceName $snapshotName -ResourceType "Microsoft.Compute/snapshots" -ResourceGroupName $ResourceGroupName -Force
+                    Write-Output "  Successfully removed resource lock: $($existingLock.Name)"
+                    $locksRemoved++
+                } else {
+                    Write-Output "  No resource lock found to remove"
+                }
+            }
+        }
+        catch {
+            $errorsCount++
+            Write-Error "Error processing snapshot '$snapshotName': $($_.Exception.Message)"
+            # Continue processing other snapshots even if one fails
+            continue
+        }
+    }
+    
+    # Summary report
+    Write-Output ""
+    Write-Output "=== EXECUTION SUMMARY ==="
+    Write-Output "Total snapshots processed: $processedCount"
+    Write-Output "Resource locks added: $locksAdded"
+    Write-Output "Resource locks removed: $locksRemoved"
+    Write-Output "Errors encountered: $errorsCount"
+    Write-Output "Execution completed successfully at: $(Get-Date)"
+    
+    if ($errorsCount -gt 0) {
+        Write-Warning "Completed with $errorsCount error(s). Please review the logs above for details."
+    }
+}
+catch {
+    Write-Error "Critical error in runbook execution: $($_.Exception.Message)"
+    Write-Error "Stack trace: $($_.ScriptStackTrace)"
+    throw
+}
+finally {
+    # Cleanup - disconnect from Azure (optional, as the runbook job will end anyway)
+    try {
+        Disconnect-AzAccount -ErrorAction SilentlyContinue
+    }
+    catch {
+        # Ignore any errors during cleanup
+    }
+}
